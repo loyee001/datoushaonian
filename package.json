@@ -1,0 +1,13 @@
+{
+  "name": "ai-classroom-console",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "大头少年 · 深空任务控制台",
+  "scripts": {
+    "start": "node --experimental-sqlite server.mjs",
+    "test": "node --experimental-sqlite --test backend.test.mjs",
+    "check": "node --check server.mjs && node --check public/app.js && node --check public/management.js && node --check public/parent.js"
+  },
+  "engines": { "node": ">=22.12.0" }
+}
