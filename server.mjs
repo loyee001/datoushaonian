@@ -4,8 +4,33 @@ import { randomBytes, scryptSync, timingSafeEqual, createHash } from 'node:crypt
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { isIP } from 'node:net';
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
+const PRODUCTION = process.env.NODE_ENV === 'production';
+const DEMO_PASSWORD = 'SpaceClass2026!';
+const configuredPassword = process.env.TEACHER_PASSWORD;
+if (PRODUCTION && (!configuredPassword || configuredPassword.length < 16 || configuredPassword === DEMO_PASSWORD)) {
+  throw new Error('Production requires a non-demo TEACHER_PASSWORD of at least 16 characters');
+}
+if (configuredPassword !== undefined && (configuredPassword.length < 10 || configuredPassword.length > 200 || configuredPassword !== configuredPassword.trim())) {
+  throw new Error('TEACHER_PASSWORD must contain 10 to 200 characters without surrounding whitespace');
+}
+let publicOrigin = null;
+if (PRODUCTION) {
+  try {
+    const value = process.env.PUBLIC_ORIGIN;
+    const parsed = new URL(value);
+    if (parsed.protocol !== 'https:' || value !== parsed.origin) throw new Error('Invalid origin');
+    publicOrigin = parsed;
+  } catch {
+    throw new Error('Production requires PUBLIC_ORIGIN to be an HTTPS origin without path, query or credentials');
+  }
+}
+const seedSetting = process.env.SEED_DEMO;
+if (seedSetting !== undefined && !['true', 'false', '1', '0'].includes(seedSetting)) throw new Error('SEED_DEMO must be true, false, 1 or 0');
+const SEED_DEMO = seedSetting === undefined ? !PRODUCTION : ['true', '1'].includes(seedSetting);
+const TRUST_LOOPBACK_PROXY = process.env.TRUST_PROXY === 'loopback';
 const DATA_DIR = path.resolve(process.env.DATA_DIR || path.join(ROOT, 'data'));
 fs.mkdirSync(DATA_DIR, { recursive: true });
 const db = new DatabaseSync(path.join(DATA_DIR, 'classroom.sqlite'));
@@ -38,36 +63,40 @@ const today = localDate();
 
 if (!db.prepare('SELECT value FROM settings WHERE key = ?').get('seeded')) {
   transaction(() => {
-    put('groups', { id: 'g-space', name: '星际探索队', projectName: 'AI 星球探险家', captain: '林子墨', introduction: '用 AI 创作属于自己的宇宙故事，学习提示词设计、图像生成与团队协作。' });
-    const kids = [
-      ['s-001','AI2026001','林子墨','小宇航员','三年级','男','林女士','13800001388'],
-      ['s-002','AI2026002','陈一诺','诺诺','四年级','女','陈先生','13900012468'],
-      ['s-003','AI2026003','王星宇','星星','三年级','男','王女士','13700022468'],
-      ['s-004','AI2026004','赵可欣','可可','四年级','女','赵女士','13600005678'],
-      ['s-005','AI2026005','刘乐天','天天','三年级','男','刘先生','13500008899'],
-      ['s-006','AI2026006','林子涵','小月亮','二年级','女','林女士','13800001388'],
-    ];
-    kids.forEach(([id,studentNo,name,nickname,grade,gender,parentName,parentPhone]) => put('students',{id,studentNo,name,nickname,grade,gender,parentName,parentPhone,avatar:'',groupId:'g-space'}));
-    put('sessions',{id:'s-today',groupId:'g-space',title:'第 06 课 · 设计我的 AI 星球',date:today,startTime:'14:00',endTime:'15:30',content:'今天我们学习用清晰的提示词描述一颗星球，尝试调整颜色、环境和生物设定，完成一张 AI 星球海报，并向伙伴介绍自己的创作。',published:true});
-    ['present','present','leave','late','pending','present'].forEach((status,index) => {
-      const studentId=kids[index][0];
-      put('attendance',{sessionId:'s-today',studentId,status,note:status==='leave'?'家长已告知今日请假':''},`s-today:${studentId}`);
-    });
-    const texts=['能独立描述星球的环境，主动修改提示词，让画面中的角色更加一致。继续保持探索精神！','今天大胆分享了自己的作品，能认真听取同伴建议，并把想法融入第二版海报。','', '虽然稍晚到课，但很快跟上了任务节奏，尝试用不同的颜色表现星球气氛。'];
-    [0,1,3].forEach((n,index)=>put('reviews',{id:`r-demo-${index+1}`,studentId:kids[n][0],sessionId:'s-today',type:'day',periodStart:today,periodEnd:today,tags:index===0?['独立创作','积极探索']:['积极参与','乐于分享'],text:texts[n],published:index<2,teacherName:'星辰老师',updatedAt:new Date().toISOString()}));
+    const hasRecords = ['groups', 'students', 'sessions', 'reviews', 'attendance', 'deleted_records'].some(table => db.prepare(`SELECT 1 FROM ${table} LIMIT 1`).get());
+    if (SEED_DEMO && !hasRecords) {
+      put('groups', { id: 'g-space', name: '星际探索队', projectName: 'AI 星球探险家', captain: '林子墨', introduction: '用 AI 创作属于自己的宇宙故事，学习提示词设计、图像生成与团队协作。' });
+      const kids = [
+        ['s-001','AI2026001','林子墨','小宇航员','三年级','男','林女士','13800001388'],
+        ['s-002','AI2026002','陈一诺','诺诺','四年级','女','陈先生','13900012468'],
+        ['s-003','AI2026003','王星宇','星星','三年级','男','王女士','13700022468'],
+        ['s-004','AI2026004','赵可欣','可可','四年级','女','赵女士','13600005678'],
+        ['s-005','AI2026005','刘乐天','天天','三年级','男','刘先生','13500008899'],
+        ['s-006','AI2026006','林子涵','小月亮','二年级','女','林女士','13800001388'],
+      ];
+      kids.forEach(([id,studentNo,name,nickname,grade,gender,parentName,parentPhone]) => put('students',{id,studentNo,name,nickname,grade,gender,parentName,parentPhone,avatar:'',groupId:'g-space'}));
+      put('sessions',{id:'s-today',groupId:'g-space',title:'第 06 课 · 设计我的 AI 星球',date:today,startTime:'14:00',endTime:'15:30',content:'今天我们学习用清晰的提示词描述一颗星球，尝试调整颜色、环境和生物设定，完成一张 AI 星球海报，并向伙伴介绍自己的创作。',published:true});
+      ['present','present','leave','late','pending','present'].forEach((status,index) => {
+        const studentId=kids[index][0];
+        put('attendance',{sessionId:'s-today',studentId,status,note:status==='leave'?'家长已告知今日请假':''},`s-today:${studentId}`);
+      });
+      const texts=['能独立描述星球的环境，主动修改提示词，让画面中的角色更加一致。继续保持探索精神！','今天大胆分享了自己的作品，能认真听取同伴建议，并把想法融入第二版海报。','', '虽然稍晚到课，但很快跟上了任务节奏，尝试用不同的颜色表现星球气氛。'];
+      [0,1,3].forEach((n,index)=>put('reviews',{id:`r-demo-${index+1}`,studentId:kids[n][0],sessionId:'s-today',type:'day',periodStart:today,periodEnd:today,tags:index===0?['独立创作','积极探索']:['积极参与','乐于分享'],text:texts[n],published:index<2,teacherName:'星辰老师',updatedAt:new Date().toISOString()}));
+    }
     db.prepare('INSERT INTO settings (key,value) VALUES (?,?)').run('seeded','1');
   });
 }
 
 const passwordSetting = db.prepare('SELECT value FROM settings WHERE key = ?').get('teacher_password');
 let passwordRecord = passwordSetting ? JSON.parse(passwordSetting.value) : null;
-if (!passwordRecord || process.env.TEACHER_PASSWORD) {
-  const password = process.env.TEACHER_PASSWORD || 'SpaceClass2026!';
-  if (password.length < 10) throw new Error('TEACHER_PASSWORD must contain at least 10 characters');
+if (!passwordRecord || configuredPassword) {
+  const password = configuredPassword || DEMO_PASSWORD;
   const salt = randomBytes(16).toString('hex');
   passwordRecord = { salt, hash:scryptSync(password,salt,64).toString('hex') };
   db.prepare('INSERT INTO settings (key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value').run('teacher_password',JSON.stringify(passwordRecord));
 }
+const demoLogin = !PRODUCTION && SEED_DEMO && timingSafeEqual(scryptSync(DEMO_PASSWORD,passwordRecord.salt,64),Buffer.from(passwordRecord.hash,'hex'));
+const secureCookie = PRODUCTION ? '; Secure' : '';
 const teacher = { name: '星辰老师' };
 const loginAttempts = new Map();
 const lookupAttempts = new Map();
@@ -158,6 +187,13 @@ function checkRate(map,key,max,windowMs,message) {
   const item=map.get(key);
   if(item&&item.until>now&&item.count>=max)fail(429,message);
   if(!item||item.until<=now)map.set(key,{count:1,until:now+windowMs});else item.count++;
+}
+function clientIp(req) {
+  const peer = req.socket.remoteAddress || 'local';
+  const address = peer.startsWith('::ffff:') ? peer.slice(7) : peer;
+  const loopback = address === '::1' || (isIP(address) === 4 && address.startsWith('127.'));
+  const forwarded = req.headers['x-real-ip'];
+  return TRUST_LOOPBACK_PROXY && loopback && typeof forwarded === 'string' && isIP(forwarded) ? forwarded : peer;
 }
 const hashToken = token => createHash('sha256').update(token).digest('hex');
 function isAuthenticated(req) {
@@ -281,12 +317,13 @@ async function api(req,res,url) {
   if(!['GET','HEAD','POST','PUT','DELETE'].includes(method))fail(405,'不支持此操作');
   if(['POST','PUT','DELETE'].includes(method)) {
     const origin=req.headers.origin;
-    if(origin&&origin!==`http://${req.headers.host}`&&origin!==`https://${req.headers.host}`)fail(403,'请求来源不被允许');
+    if(PRODUCTION ? origin!==publicOrigin.origin : origin&&origin!==`http://${req.headers.host}`&&origin!==`https://${req.headers.host}`)fail(403,'请求来源不被允许');
     if(req.headers['sec-fetch-site']==='cross-site')fail(403,'请求来源不被允许');
   }
   if(p==='/api/health'&&method==='GET')return json(res,200,{ok:true});
+  if(p==='/api/config'&&method==='GET')return json(res,200,{demoLogin});
   if(p==='/api/auth/login'&&method==='POST') {
-    const key=req.socket.remoteAddress||'local';
+    const key=clientIp(req);
     checkRate(loginAttempts,key,10,15*60*1000,'登录尝试过于频繁，请稍后再试');
     const body=await bodyOf(req);
     const password=string(body.password,'密码',200,true);
@@ -296,13 +333,13 @@ async function api(req,res,url) {
     db.prepare('DELETE FROM auth_sessions WHERE expires_at < ?').run(Date.now());
     const token=randomBytes(32).toString('hex');
     db.prepare('INSERT INTO auth_sessions (token_hash,expires_at) VALUES (?,?)').run(hashToken(token),Date.now()+TTL);
-    return json(res,200,{user:teacher},{'Set-Cookie':`classroom_session=${token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${TTL/1000}`});
+    return json(res,200,{user:teacher},{'Set-Cookie':`classroom_session=${token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${TTL/1000}${secureCookie}`});
   }
   if(p==='/api/auth/me'&&method==='GET'){if(!isAuthenticated(req))fail(401,'请先登录教师账号');return json(res,200,{user:teacher});}
   if(p==='/api/auth/logout'&&method==='POST') {
     const token=/(?:^|;\s*)classroom_session=([^;]+)/.exec(req.headers.cookie||'')?.[1];
     if(token)db.prepare('DELETE FROM auth_sessions WHERE token_hash=?').run(hashToken(token));
-    return json(res,200,{ok:true},{'Set-Cookie':'classroom_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0'});
+    return json(res,200,{ok:true},{'Set-Cookie':`classroom_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0${secureCookie}`});
   }
   const parentMatch=/^\/api\/parent\/session\/([^/]+)$/.exec(p);
   if(parentMatch&&method==='GET') {
@@ -310,7 +347,7 @@ async function api(req,res,url) {
     return json(res,200,{session:headerOf(session)});
   }
   if(p==='/api/parent/lookup'&&method==='POST') {
-    checkRate(lookupAttempts,req.socket.remoteAddress||'local',30,5*60*1000,'查询次数较多，请 5 分钟后再试');
+    checkRate(lookupAttempts,clientIp(req),30,5*60*1000,'查询次数较多，请 5 分钟后再试');
     const body=await bodyOf(req),session=requireItem('sessions',string(body.sessionId,'课程',100,true),'课程');
     const suffix=string(body.suffix,'手机号尾号',11,true);
     if(!/^\d{4,11}$/.test(suffix))fail(400,'请输入手机号后 4 至 11 位');
@@ -396,6 +433,7 @@ const server=http.createServer(async(req,res)=>{
   res.setHeader('X-Content-Type-Options','nosniff');res.setHeader('Referrer-Policy','no-referrer');res.setHeader('X-Frame-Options','DENY');
   res.setHeader('Content-Security-Policy',"default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'");
   try{
+    if(PRODUCTION && req.headers.host!==publicOrigin.host)fail(403,'请求地址不被允许');
     const url=new URL(req.url,'http://localhost');
     if(url.pathname.startsWith('/api/'))return await api(req,res,url);
     if(req.method!=='GET'&&req.method!=='HEAD')fail(405,'不支持此操作');

@@ -6,15 +6,56 @@ import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
+import { request as httpRequest } from 'node:http';
 
 const root=path.dirname(fileURLToPath(import.meta.url));
+function testEnv(overrides={}) {
+  const env={...process.env,NODE_ENV:'test'};
+  for(const key of ['TEACHER_PASSWORD','PUBLIC_ORIGIN','TRUST_PROXY','SEED_DEMO'])delete env[key];
+  for(const [key,value]of Object.entries(overrides)){if(value===undefined)delete env[key];else env[key]=value;}
+  return env;
+}
+
+function isolatedServer(t,defaults={}) {
+  const directory=fs.mkdtempSync(path.join(os.tmpdir(),'classroom-production-test-'));
+  const dataDir=path.join(directory,'data');
+  let child,base;
+  async function stop(){if(child&&child.exitCode===null)await new Promise(resolve=>{child.once('exit',resolve);child.kill('SIGTERM');});}
+  t.after(async()=>{await stop();fs.rmSync(directory,{recursive:true,force:true});});
+  return {
+    dataDir,stop,
+    async start(overrides={}) {
+      await stop();
+      const env=testEnv({DATA_DIR:dataDir,PORT:'0',HOST:'127.0.0.1',...defaults,...overrides});
+      child=spawn(process.execPath,['--experimental-sqlite',path.join(root,'server.mjs')],{env,stdio:['ignore','pipe','pipe']});
+      let output='',errors='';child.stderr.on('data',chunk=>errors+=chunk.toString());
+      base=await new Promise((resolve,reject)=>{
+        const timer=setTimeout(()=>{child.kill('SIGTERM');reject(new Error('Server start timed out'));},10000);
+        child.stdout.on('data',chunk=>{output+=chunk.toString();const match=/http:\/\/127\.0\.0\.1:\d+/.exec(output);if(match){clearTimeout(timer);resolve(match[0]);}});
+        child.once('error',error=>{clearTimeout(timer);reject(error);});
+        child.once('exit',code=>{clearTimeout(timer);reject(new Error(`Server exited ${code}: ${errors}`));});
+      });
+    },
+    async call(route,{method='GET',body,headers={}}={}) {
+      // Use raw HTTP so Host and Origin assertions exercise the exact supplied headers.
+      return new Promise((resolve,reject)=>{
+        const request=httpRequest(base+route,{method,headers:{...(body===undefined?{}:{'Content-Type':'application/json'}),...headers}},response=>{
+          let text='';response.setEncoding('utf8');response.on('data',chunk=>text+=chunk);
+          response.on('error',reject);response.on('end',()=>{
+            try{resolve({status:response.statusCode,headers:new Headers(Object.entries(response.headers).flatMap(([key,value])=>Array.isArray(value)?value.map(item=>[key,item]):[[key,value]])),result:JSON.parse(text)});}catch(error){reject(error);}
+          });
+        });
+        request.on('error',reject);request.end(body===undefined?undefined:JSON.stringify(body));
+      });
+    }
+  };
+}
 
 test('classroom backend: authentication, persistence, parent privacy and exports',async t=>{
   const directory=fs.mkdtempSync(path.join(os.tmpdir(),'classroom-test-'));
   let server,base,cookie='';
   async function start(){
-    const env={...process.env,DATA_DIR:directory,PORT:'0',HOST:'127.0.0.1'};
-    delete env.TEACHER_PASSWORD;
+    const env=testEnv({DATA_DIR:directory,PORT:'0',HOST:'127.0.0.1'});
     server=spawn(process.execPath,['--experimental-sqlite',path.join(root,'server.mjs')],{env,stdio:['ignore','pipe','pipe']});
     let output='',errors='';server.stderr.on('data',chunk=>errors+=chunk.toString());
     base=await new Promise((resolve,reject)=>{
@@ -270,7 +311,7 @@ test('multi-group courses: enrollment, privacy, exports and overlapping recoveri
   const directory=fs.mkdtempSync(path.join(os.tmpdir(),'classroom-multi-test-'));
   let server,base,cookie='';
   async function start(){
-    const env={...process.env,DATA_DIR:directory,PORT:'0',HOST:'127.0.0.1'};delete env.TEACHER_PASSWORD;
+    const env=testEnv({DATA_DIR:directory,PORT:'0',HOST:'127.0.0.1'});
     server=spawn(process.execPath,['--experimental-sqlite',path.join(root,'server.mjs')],{env,stdio:['ignore','pipe','pipe']});
     let output='',errors='';server.stderr.on('data',chunk=>errors+=chunk.toString());
     base=await new Promise((resolve,reject)=>{
@@ -391,4 +432,106 @@ test('multi-group courses: enrollment, privacy, exports and overlapping recoveri
     const before=await boot();const conflict=await restore(deletion.id);assert.equal(conflict.status,409);assert.match(conflict.result.error,/原课程日期已改变/);assert.deepEqual(await boot(),before);assert.ok((await call('/api/deletions')).result.deletions.some(d=>d.id===deletion.id));
     await call(`/api/sessions/${shared.id}`,{method:'PUT',body:{date:'2026-10-01'}});assert.equal((await restore(deletion.id)).status,200);
   });
+});
+
+const productionEnv={NODE_ENV:'production',PUBLIC_ORIGIN:'https://classroom.example',TEACHER_PASSWORD:'Production-Test-Password-42'};
+const productionHeaders={Host:'classroom.example',Origin:'https://classroom.example'};
+const productionLogin={username:'teacher',password:productionEnv.TEACHER_PASSWORD};
+
+test('production settings fail before creating a database',async t=>{
+  const server=isolatedServer(t,productionEnv);
+  const invalid=[
+    {TEACHER_PASSWORD:undefined},{TEACHER_PASSWORD:''},{TEACHER_PASSWORD:'Too-short-123'},
+    {TEACHER_PASSWORD:'SpaceClass2026!'},{TEACHER_PASSWORD:' '+productionEnv.TEACHER_PASSWORD},
+    {PUBLIC_ORIGIN:undefined},{PUBLIC_ORIGIN:'http://classroom.example'},
+    {PUBLIC_ORIGIN:'https://classroom.example/path'},{PUBLIC_ORIGIN:'https://user:password@classroom.example'},
+    {PUBLIC_ORIGIN:'https://classroom.example?query=1'},{PUBLIC_ORIGIN:'https://classroom.example#fragment'},
+    {SEED_DEMO:'invalid'}
+  ];
+  for(const config of invalid){
+    await assert.rejects(server.start(config),/Production requires|TEACHER_PASSWORD must|SEED_DEMO must/);
+    assert.equal(fs.existsSync(server.dataDir),false,'Invalid configuration must not create the data directory');
+  }
+});
+
+test('production host, origin, cookies and static isolation',async t=>{
+  const server=isolatedServer(t,productionEnv);await server.start();
+  const call=(route,options={})=>server.call(route,{...options,headers:{...productionHeaders,...options.headers}});
+  assert.deepEqual((await call('/api/config')).result,{demoLogin:false});
+  assert.deepEqual((await call('/api/health')).result,{ok:true});
+  assert.equal((await server.call('/api/health')).status,403);
+  assert.equal((await call('/api/health',{headers:{Host:'untrusted.example'}})).status,403);
+  for(const Origin of ['', 'http://classroom.example', 'https://untrusted.example']){
+    assert.equal((await call('/api/auth/login',{method:'POST',body:productionLogin,headers:{Origin}})).status,403);
+  }
+  assert.equal((await server.call('/api/auth/login',{method:'POST',body:productionLogin,headers:{Host:'classroom.example'}})).status,403);
+  assert.equal((await call('/api/auth/login',{method:'POST',body:productionLogin,headers:{'Sec-Fetch-Site':'cross-site'}})).status,403);
+  assert.equal((await call('/api/auth/login',{method:'POST',body:{username:'teacher',password:'SpaceClass2026!'}})).status,401);
+  const login=await call('/api/auth/login',{method:'POST',body:productionLogin});assert.equal(login.status,200);
+  const cookie=login.headers.get('set-cookie');for(const attr of ['Secure','HttpOnly','SameSite=Strict'])assert.ok(cookie.includes(attr));
+  const bootstrap=await call('/api/bootstrap',{headers:{Cookie:cookie.split(';')[0]}});assert.equal(bootstrap.status,200);
+  for(const table of ['groups','students','sessions','attendance','reviews'])assert.deepEqual(bootstrap.result[table],[]);
+  for(const route of ['/data/classroom.sqlite','/.env','/server.mjs','/%2e%2e%2fserver.mjs'])assert.equal((await call(route)).status,404);
+  const logout=await call('/api/auth/logout',{method:'POST',headers:{Cookie:cookie.split(';')[0]}});assert.equal(logout.status,200);
+  assert.match(logout.headers.get('set-cookie'),/Max-Age=0/);assert.match(logout.headers.get('set-cookie'),/; Secure(?:;|$)/);
+  assert.equal((await call('/api/auth/me',{headers:{Cookie:cookie.split(';')[0]}})).status,401);
+});
+
+test('production blank initialization stays blank and preserves subsequent records across restarts',async t=>{
+  const server=isolatedServer(t,productionEnv);
+  async function boot(){
+    const login=await server.call('/api/auth/login',{method:'POST',headers:productionHeaders,body:productionLogin});assert.equal(login.status,200);
+    const headers={...productionHeaders,Cookie:login.headers.get('set-cookie').split(';')[0]};
+    return {headers,data:(await server.call('/api/bootstrap',{headers})).result};
+  }
+  await server.start();
+  for(const values of Object.values((await boot()).data).filter(Array.isArray))assert.deepEqual(values,[]);
+  await server.stop();await server.start({SEED_DEMO:'true'});
+  let state=await boot();for(const values of Object.values(state.data).filter(Array.isArray))assert.deepEqual(values,[]);
+  assert.deepEqual((await server.call('/api/config',{headers:productionHeaders})).result,{demoLogin:false});
+  const group=await server.call('/api/groups',{method:'POST',headers:state.headers,body:{name:'生产持久化测试组',projectName:'保留项目'}});assert.equal(group.status,201);
+  await server.stop();await server.start({SEED_DEMO:'false'});
+  state=await boot();assert.deepEqual(state.data.groups,[group.result.group]);assert.deepEqual(state.data.students,[]);
+  await server.stop();
+  const database=new DatabaseSync(path.join(server.dataDir,'classroom.sqlite'));
+  assert.equal(database.prepare('SELECT value FROM settings WHERE key=?').get('seeded').value,'1');
+  database.prepare('DELETE FROM settings WHERE key=?').run('seeded');database.close();
+  await server.start({SEED_DEMO:'true'});
+  state=await boot();assert.deepEqual(state.data.groups,[group.result.group]);assert.deepEqual(state.data.students,[]);
+});
+
+test('demo login config depends on local mode, seed setting and the stored password',async t=>{
+  const server=isolatedServer(t);await server.start();
+  assert.deepEqual((await server.call('/api/config')).result,{demoLogin:true});
+  const login=await server.call('/api/auth/login',{method:'POST',body:{username:'teacher',password:'SpaceClass2026!'}});
+  assert.equal(login.status,200);assert.equal(login.headers.get('set-cookie').includes('Secure'),false);
+  await server.stop();await server.start({TEACHER_PASSWORD:productionEnv.TEACHER_PASSWORD});
+  assert.deepEqual((await server.call('/api/config')).result,{demoLogin:false});
+  await server.stop();await server.start();
+  assert.deepEqual((await server.call('/api/config')).result,{demoLogin:false});
+  await server.stop();await server.start({TEACHER_PASSWORD:'SpaceClass2026!',SEED_DEMO:'false'});
+  assert.deepEqual((await server.call('/api/config')).result,{demoLogin:false});
+});
+
+test('trusted loopback proxy separates rate limits and rejects invalid forwarded addresses',async t=>{
+  const server=isolatedServer(t,{...productionEnv,TRUST_PROXY:'loopback'});await server.start();
+  const login=ip=>server.call('/api/auth/login',{method:'POST',headers:{...productionHeaders,...(ip?{'X-Real-IP':ip}:{})},body:{username:'teacher',password:'incorrect'}});
+  for(let i=0;i<10;i++)assert.equal((await login('198.51.100.10')).status,401);
+  assert.equal((await login('198.51.100.10')).status,429);
+  assert.equal((await login('198.51.100.11')).status,401);
+  const lookup=ip=>server.call('/api/parent/lookup',{method:'POST',headers:{...productionHeaders,'X-Real-IP':ip},body:{sessionId:'not-a-course',suffix:'1234'}});
+  for(let i=0;i<30;i++)assert.equal((await lookup('2001:db8::1')).status,404);
+  assert.equal((await lookup('2001:db8::1')).status,429);
+  assert.equal((await lookup('2001:db8::2')).status,404);
+  for(let i=0;i<10;i++)assert.equal((await login(i%2?'198.51.100.20, 198.51.100.21':`invalid-${i}`)).status,401);
+  assert.equal((await login()).status,429);
+  assert.equal((await server.call('/api/auth/login',{method:'POST',headers:{...productionHeaders,'X-Forwarded-For':'198.51.100.30'},body:{username:'teacher',password:'incorrect'}})).status,429);
+});
+
+test('forwarded client addresses are ignored when proxy trust is not enabled',async t=>{
+  const server=isolatedServer(t,productionEnv);await server.start();
+  for(let i=0;i<11;i++){
+    const response=await server.call('/api/auth/login',{method:'POST',headers:{...productionHeaders,'X-Real-IP':`198.51.100.${i+1}`},body:{username:'teacher',password:'incorrect'}});
+    assert.equal(response.status,i===10?429:401);
+  }
 });
